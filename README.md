@@ -109,13 +109,32 @@ That's it. From then on, any change your game makes to a tracked instance under
 the sync root replicates to every other server. Your game code doesn't call any
 special API — it just edits instances.
 
-Sync more properties or classes at runtime:
+**Attributes** are synced automatically and completely — every attribute on a
+tracked instance, including custom ones added at runtime, replicates (unlike
+properties, attributes are fully enumerable, so no whitelist is needed).
+
+Sync more **properties** or classes at runtime:
 
 ```lua
 local ServerExpansion = require(game.ServerScriptService.ServerExpansion)
-ServerExpansion.Schema.add("BasePart", { "Name", "Transparency" })
+
+-- Add properties to a class group:
+ServerExpansion.Schema.add("BasePart", { "Transparency" })
 ServerExpansion.Schema.extend("BoolValue", { "Value" })
+
+-- Or a GLOBAL custom whitelist: for EVERY tracked instance, if it actually has
+-- the property it is synced; if not, it is ignored for that instance.
+ServerExpansion.Schema.addCustom({ "Transparency", "CanCollide" })
 ```
+
+### What gets synced
+
+- **Properties**: whatever the per-class schema lists *and* the instance actually
+  exposes (broad defaults for parts, models, humanoids, lights, sounds, effects,
+  constraints, GUIs, UI helpers, value objects, …). Extend as shown above.
+- **Attributes**: all of them, always — added, changed, and removed.
+- **Structure**: instances being created, reparented, and deleted.
+- **Only changes**: unchanged instances/properties/attributes send nothing.
 
 ---
 
@@ -141,9 +160,10 @@ ServerExpansion.Schema.extend("BoolValue", { "Value" })
 Roblox has no native shared world; this framework stitches one together from
 rate-limited services. Design accordingly:
 
-- **No arbitrary-property reflection.** Luau can't enumerate every property of an
-  instance, so a per-class **whitelist** (`Schema.luau`) decides what syncs. Add
-  to it as needed.
+- **No arbitrary-property reflection.** Luau can't enumerate every *property* of
+  an instance, so a per-class **whitelist** (`Schema.luau`) decides which
+  properties sync — add to it via `Schema.add` / `addCustom`. **Attributes**, by
+  contrast, *are* enumerable and so are synced in full with no whitelist.
 - **Rate limits are real.** MessagingService messages are ≤ 1KB and throttled;
   MemoryStore values are ≤ 32KB with a per-player request budget. This suits
   **world state that changes at human speed** (doors, builds, ownership, toggles,
@@ -239,18 +259,30 @@ ServerExpansion.start({
 
 就这样。之后你的游戏对同步根下被追踪实例做的任何改动都会复制到其它所有服。你的游戏代码不需要调用特殊 API —— 只管改实例即可。
 
-运行时扩展要同步的属性/类：
+**Attributes（属性/Attributes）自动完整同步**：被追踪实例上的每一个 attribute（包括运行时新增的自定义 attribute）都会复制——因为 attribute 可以枚举，所以不需要白名单。
+
+运行时扩展要同步的**属性（Properties）**或类：
 
 ```lua
+-- 给某个类加属性：
 ServerExpansion.Schema.add("BasePart", { "Transparency" })
 ServerExpansion.Schema.extend("BoolValue", { "Value" })
+
+-- 或全局自定义白名单：对每个被追踪实例，若它确实有这个属性就同步，没有就忽略。
+ServerExpansion.Schema.addCustom({ "Transparency", "CanCollide" })
 ```
+
+**同步的内容**：
+- **属性 Properties**：schema 里列出的、且实例确实拥有的（对 Part/Model/Humanoid/灯光/声音/特效/约束/GUI/UI 组件/Value 对象等有较广的默认覆盖），可按上面扩展。
+- **Attributes**：全部，始终同步——新增、修改、删除都同步。
+- **结构**：实例的新建、改父级、删除。
+- **只发有改动的**：没变的实例/属性/attribute 不发任何东西。
 
 ## 限制与注意事项（务必阅读）
 
 Roblox 没有原生共享世界，本框架是用有配额限制的服务拼出来的，请据此设计：
 
-- **无法反射任意属性**：Luau 拿不到实例的全部属性，所以由按类的**白名单**（`Schema.luau`）决定同步哪些，可自行扩展。
+- **无法反射任意属性（Property）**：Luau 拿不到实例的全部属性，所以由按类的**白名单**（`Schema.luau`）决定同步哪些，可用 `Schema.add` / `addCustom` 扩展。而 **Attributes** 可以枚举，所以全部完整同步、无需白名单。
 - **速率限制是真实存在的**：MessagingService 单消息 ≤ 1KB 且有频率上限；MemoryStore 值 ≤ 32KB 且按人数给请求预算。它适合**以人类速度变化的世界状态**（门、搭建、归属、开关、道具位置），**无法**逐帧串流成千上万个 Part 的物理。快速移动（含玩家）会被合并/节流并有可见延迟。
 - **冲突取最新版**：逐属性、按版本顺序的 last-writer-wins —— 正是"最新版本优先"。没有三方合并。
 - **只发有改动的**：未改动的实例零开销。这是模型的核心，而非可配置的优化。

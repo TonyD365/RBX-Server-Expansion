@@ -40,6 +40,7 @@ local tracked: { [Instance]: Tracked } = {}
 local createdOrder: { Instance } = {} -- instances added locally this interval (order preserved)
 local createdSet: { [Instance]: boolean } = {}
 local dirtyProps: { [string]: { [string]: boolean } } = {} -- id -> set of changed prop names
+local dirtyAttrs: { [string]: { [string]: boolean } } = {} -- id -> set of changed attribute names
 local deletedIds: { [string]: boolean } = {} -- ids removed locally this interval
 
 local function log(...)
@@ -84,6 +85,25 @@ local function markDirty(id: string, prop: string)
 	bucket[prop] = true
 end
 
+local function markDirtyAttr(id: string, name: string)
+	local bucket = dirtyAttrs[id]
+	if not bucket then
+		bucket = {}
+		dirtyAttrs[id] = bucket
+	end
+	bucket[name] = true
+end
+
+-- Encode an attribute's current value; a removed (nil) attribute becomes the
+-- REMOVED marker so it round-trips as a deletion rather than vanishing.
+local function encodeAttr(instance: Instance, name: string): (any, boolean)
+	local value = instance:GetAttribute(name)
+	if value == nil then
+		return Codec.REMOVED, true
+	end
+	return Codec.encode(value)
+end
+
 -- Connect property-changed signals and register the instance. `emitCreate`
 -- controls whether a genuine local add is recorded as a create op (false for
 -- the initial startup scan and for remote-applied instances).
@@ -112,6 +132,24 @@ local function track(instance: Instance, emitCreate: boolean)
 		if ok and conn then
 			table.insert(connections, conn)
 		end
+	end
+
+	-- One connection covers ALL attributes, including custom ones added at
+	-- runtime -- unlike properties, attributes are fully enumerable.
+	local attrOk, attrConn = pcall(function()
+		return instance.AttributeChanged:Connect(function(name: string)
+			local encoded, encodable = encodeAttr(instance, name)
+			if not encodable then
+				return
+			end
+			if Applier.consumeExpectedAttr(id, name, encoded) then
+				return
+			end
+			markDirtyAttr(id, name)
+		end)
+	end)
+	if attrOk and attrConn then
+		table.insert(connections, attrConn)
 	end
 
 	tracked[instance] = { id = id, connections = connections }
@@ -211,6 +249,18 @@ local function encodeAllProps(instance: Instance): { [string]: any }
 	return props
 end
 
+-- Read every attribute on the instance (all are enumerable via GetAttributes).
+local function encodeAllAttrs(instance: Instance): { [string]: any }
+	local attrs: { [string]: any } = {}
+	for name, value in pairs(instance:GetAttributes()) do
+		local encoded, encodable = Codec.encode(value)
+		if encodable then
+			attrs[name] = encoded
+		end
+	end
+	return attrs
+end
+
 -- Drain accumulated changes into an ordered list of ops, then reset. Returns
 -- an empty table when nothing changed.
 function ChangeTracker.collect(): { any }
@@ -227,28 +277,54 @@ function ChangeTracker.collect(): { any }
 					class = instance.ClassName,
 					parentId = parentIdOf(instance),
 					props = encodeAllProps(instance),
+					attrs = encodeAllAttrs(instance),
 				})
-				-- Its initial props are already in the create; clear any dirt.
+				-- Its initial props/attrs are already in the create; clear dirt.
 				dirtyProps[id] = nil
+				dirtyAttrs[id] = nil
 			end
 		end
 	end
 
-	-- 2) Updates for existing (non-created) instances.
-	for id, propSet in pairs(dirtyProps) do
+	-- 2) Updates for existing (non-created) instances: changed props + attrs.
+	local updateIds: { [string]: boolean } = {}
+	for id in pairs(dirtyProps) do
+		updateIds[id] = true
+	end
+	for id in pairs(dirtyAttrs) do
+		updateIds[id] = true
+	end
+	for id in pairs(updateIds) do
 		local instance = Identity.getInstance(id)
 		if instance then
 			local props: { [string]: any } = {}
+			local attrs: { [string]: any } = {}
 			local any = false
-			for prop in pairs(propSet) do
-				local encoded, encodable = Codec.encode((instance :: any)[prop])
-				if encodable then
-					props[prop] = encoded
-					any = true
+
+			local propSet = dirtyProps[id]
+			if propSet then
+				for prop in pairs(propSet) do
+					local encoded, encodable = Codec.encode((instance :: any)[prop])
+					if encodable then
+						props[prop] = encoded
+						any = true
+					end
 				end
 			end
+
+			local attrSet = dirtyAttrs[id]
+			if attrSet then
+				for name in pairs(attrSet) do
+					local encoded, encodable = encodeAttr(instance, name)
+					if encodable then
+						attrs[name] = encoded
+						any = true
+					end
+				end
+			end
+
 			if any then
-				table.insert(ops, { op = "update", id = id, props = props })
+				table.insert(ops, { op = "update", id = id, props = props, attrs = attrs })
 			end
 		end
 	end
@@ -262,6 +338,7 @@ function ChangeTracker.collect(): { any }
 	table.clear(createdOrder)
 	table.clear(createdSet)
 	table.clear(dirtyProps)
+	table.clear(dirtyAttrs)
 	table.clear(deletedIds)
 
 	return ops
@@ -281,6 +358,7 @@ function ChangeTracker.serializeWorld(): { any }
 				class = instance.ClassName,
 				parentId = parentIdOf(instance),
 				props = encodeAllProps(instance),
+				attrs = encodeAllAttrs(instance),
 			})
 		end
 	end

@@ -29,6 +29,7 @@ local syncRoot: Instance = workspace
 local debugLog = false
 
 local expectedProps: { [string]: { [string]: any } } = {}
+local expectedAttrs: { [string]: { [string]: any } } = {}
 local expectedCreates: { [string]: boolean } = {}
 local expectedDeletes: { [string]: boolean } = {}
 local pendingChildren: { [string]: { any } } = {} -- parentId -> list of create ops
@@ -51,6 +52,16 @@ function Applier.consumeExpected(id: string, prop: string, encoded: any): boolea
 	local props = expectedProps[id]
 	if props and props[prop] ~= nil and Codec.equal(props[prop], encoded) then
 		props[prop] = nil
+		return true
+	end
+	return false
+end
+
+-- Returns true if this attribute change was one we just applied (so skip it).
+function Applier.consumeExpectedAttr(id: string, name: string, encoded: any): boolean
+	local attrs = expectedAttrs[id]
+	if attrs and attrs[name] ~= nil and Codec.equal(attrs[name], encoded) then
+		attrs[name] = nil
 		return true
 	end
 	return false
@@ -99,6 +110,34 @@ local function setProps(instance: Instance, id: string, props: { [string]: any }
 	end
 end
 
+local function recordExpectedAttr(id: string, name: string, encoded: any)
+	local bucket = expectedAttrs[id]
+	if not bucket then
+		bucket = {}
+		expectedAttrs[id] = bucket
+	end
+	bucket[name] = encoded
+end
+
+local function setAttrs(instance: Instance, id: string, attrs: { [string]: any })
+	for name, encoded in pairs(attrs) do
+		recordExpectedAttr(id, name, encoded)
+		-- The REMOVED marker means "unset this attribute".
+		local isRemoval = typeof(encoded) == "table" and encoded.t == "Removed"
+		local value = if isRemoval then nil else Codec.decode(encoded)
+		-- Skip unresolved instance refs (target not here yet).
+		local isUnresolvedRef = typeof(encoded) == "table" and encoded.t == "Ref" and value == nil
+		if not isUnresolvedRef then
+			local ok, err = pcall(function()
+				instance:SetAttribute(name, value)
+			end)
+			if not ok then
+				log("failed to set attribute", name, "on", id, err)
+			end
+		end
+	end
+end
+
 local function resolveParent(parentId: string): Instance?
 	if parentId == Applier.ROOT_PARENT_ID then
 		return syncRoot
@@ -126,6 +165,7 @@ function applyCreate(op: any)
 	local existing = Identity.getInstance(id)
 	if existing then
 		setProps(existing, id, op.props or {})
+		setAttrs(existing, id, op.attrs or {})
 		return
 	end
 
@@ -153,6 +193,7 @@ function applyCreate(op: any)
 	expectedCreates[id] = true
 	Identity.adopt(instance, id)
 	setProps(instance, id, op.props or {})
+	setAttrs(instance, id, op.attrs or {})
 	instance.Parent = parent
 
 	-- Any children that were waiting on this instance can now be created.
@@ -168,6 +209,7 @@ local function applyUpdate(op: any)
 		return
 	end
 	setProps(instance, op.id, op.props or {})
+	setAttrs(instance, op.id, op.attrs or {})
 end
 
 local function applyDelete(op: any)
@@ -181,6 +223,8 @@ local function applyDelete(op: any)
 	end
 	Identity.unregister(id)
 	pendingChildren[id] = nil
+	expectedProps[id] = nil
+	expectedAttrs[id] = nil
 end
 
 function Applier.applyOp(op: any)

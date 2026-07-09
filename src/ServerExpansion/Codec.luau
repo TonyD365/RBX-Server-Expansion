@@ -17,6 +17,11 @@ local Identity = require(script.Parent.Identity)
 
 local Codec = {}
 
+-- Sentinel meaning "this attribute was removed / set to nil". Attributes can be
+-- deleted, which a plain nil can't represent inside a serialized table (the key
+-- would simply vanish), so removals are encoded as this marker instead.
+Codec.REMOVED = { t = "Removed" }
+
 -- Encode a single value into a JSON-safe form. Returns (encoded, ok).
 function Codec.encode(value: any): (any, boolean)
 	local t = typeof(value)
@@ -45,6 +50,22 @@ function Codec.encode(value: any): (any, boolean)
 		}, true
 	elseif t == "NumberRange" then
 		return { t = "NumberRange", min = value.Min, max = value.Max }, true
+	elseif t == "Rect" then
+		return { t = "Rect", x0 = value.Min.X, y0 = value.Min.Y, x1 = value.Max.X, y1 = value.Max.Y }, true
+	elseif t == "NumberSequence" then
+		local keys = {}
+		for _, kp in ipairs(value.Keypoints) do
+			table.insert(keys, { kp.Time, kp.Value, kp.Envelope })
+		end
+		return { t = "NumberSequence", k = keys }, true
+	elseif t == "ColorSequence" then
+		local keys = {}
+		for _, kp in ipairs(value.Keypoints) do
+			table.insert(keys, { kp.Time, kp.Value.R, kp.Value.G, kp.Value.B })
+		end
+		return { t = "ColorSequence", k = keys }, true
+	elseif t == "Font" then
+		return { t = "Font", f = value.Family, w = value.Weight.Name, s = value.Style.Name }, true
 	elseif t == "EnumItem" then
 		return { t = "Enum", e = tostring(value.EnumType), v = value.Value }, true
 	elseif t == "Instance" then
@@ -83,6 +104,24 @@ function Codec.decode(encoded: any): any
 		return UDim2.new(encoded.xs, encoded.xo, encoded.ys, encoded.yo)
 	elseif t == "NumberRange" then
 		return NumberRange.new(encoded.min, encoded.max)
+	elseif t == "Rect" then
+		return Rect.new(encoded.x0, encoded.y0, encoded.x1, encoded.y1)
+	elseif t == "NumberSequence" then
+		local keypoints = {}
+		for _, k in ipairs(encoded.k) do
+			table.insert(keypoints, NumberSequenceKeypoint.new(k[1], k[2], k[3]))
+		end
+		return NumberSequence.new(keypoints)
+	elseif t == "ColorSequence" then
+		local keypoints = {}
+		for _, k in ipairs(encoded.k) do
+			table.insert(keypoints, ColorSequenceKeypoint.new(k[1], Color3.new(k[2], k[3], k[4])))
+		end
+		return ColorSequence.new(keypoints)
+	elseif t == "Font" then
+		local weight = (Enum.FontWeight :: any)[encoded.w] or Enum.FontWeight.Regular
+		local style = (Enum.FontStyle :: any)[encoded.s] or Enum.FontStyle.Normal
+		return Font.new(encoded.f, weight, style)
 	elseif t == "Enum" then
 		-- encoded.e looks like "Enum.Material"; strip the prefix.
 		local enumName = string.gsub(encoded.e, "^Enum%.", "")
