@@ -36,6 +36,7 @@ local snapshotStore: any
 local headTtl = 3888000
 local commitTtl = 3600
 local lockTtl = 90
+local snapshotChunkSize = 500
 local debugLog = false
 
 local function log(...)
@@ -74,6 +75,7 @@ function Repository.configure(config: any)
 	headTtl = config.headTtl
 	commitTtl = config.commitTtl
 	lockTtl = config.lockTtl
+	snapshotChunkSize = math.max(1, config.snapshotChunkSize or 500)
 	debugLog = config.debug
 end
 
@@ -154,28 +156,103 @@ function Repository.getCommitsAfter(fromExclusive: number, toInclusive: number):
 	return commits
 end
 
---== Snapshot (DataStore) ==--
+--== Snapshot (DataStore), stored in fixed-key chunks ==--
+--
+-- The whole world can exceed the 4MB DataStore value limit, so a snapshot is
+-- split across chunk keys "<SNAPSHOT_KEY>_<i>" plus a "<SNAPSHOT_KEY>_meta" key
+-- describing the set. Keys are FIXED and overwritten in place, so the store
+-- still holds only the latest snapshot (no version pile-up). Each chunk carries
+-- the snapshot version so a reader can detect a half-written ("torn") snapshot.
+
+local function metaKey(): string
+	return SNAPSHOT_KEY .. "_meta"
+end
+
+local function chunkKey(i: number): string
+	return SNAPSHOT_KEY .. "_" .. i
+end
 
 function Repository.saveSnapshot(records: { any }, version: number): boolean
-	local ok = retry(function()
-		snapshotStore:SetAsync(SNAPSHOT_KEY, {
+	local chunkCount = math.ceil(#records / snapshotChunkSize)
+
+	-- Learn how many chunks the previous snapshot used, so we can delete any
+	-- that are now surplus (world shrank) and keep only the latest set.
+	local prevChunks = 0
+	local okOld, oldMeta = retry(function()
+		return snapshotStore:GetAsync(metaKey())
+	end)
+	if okOld and typeof(oldMeta) == "table" and typeof(oldMeta.chunks) == "number" then
+		prevChunks = oldMeta.chunks
+	end
+
+	-- Write each chunk (overwrite in place).
+	for i = 1, chunkCount do
+		local from = (i - 1) * snapshotChunkSize + 1
+		local to = math.min(i * snapshotChunkSize, #records)
+		local slice = table.move(records, from, to, 1, {})
+		local ok = retry(function()
+			snapshotStore:SetAsync(chunkKey(i), { v = version, records = slice })
+			return true
+		end)
+		if not ok then
+			log("failed to write snapshot chunk", i)
+			return false
+		end
+	end
+
+	-- Remove chunks left over from a previously larger snapshot.
+	for i = chunkCount + 1, prevChunks do
+		retry(function()
+			snapshotStore:RemoveAsync(chunkKey(i))
+			return true
+		end)
+	end
+
+	-- Meta is written LAST: it is the commit point that publishes the new set.
+	return retry(function()
+		snapshotStore:SetAsync(metaKey(), {
 			v = version,
-			records = records,
+			chunks = chunkCount,
 			savedAt = os.time(),
 		})
 		return true
 	end)
-	return ok
 end
 
--- Returns { v = number, records = {...} } or nil.
+-- Returns { v = number, records = {...} } or nil (no snapshot, or torn after
+-- retries -- in which case the caller falls back to replaying the commit log).
 function Repository.loadSnapshot(): any?
-	local ok, value = retry(function()
-		return snapshotStore:GetAsync(SNAPSHOT_KEY)
-	end)
-	if ok and typeof(value) == "table" then
-		return value
+	for _ = 1, 3 do
+		local okMeta, meta = retry(function()
+			return snapshotStore:GetAsync(metaKey())
+		end)
+		if not okMeta or typeof(meta) ~= "table" then
+			return nil -- no snapshot exists yet
+		end
+
+		local chunkCount = tonumber(meta.chunks) or 0
+		local records: { any } = {}
+		local torn = false
+		for i = 1, chunkCount do
+			local okChunk, chunk = retry(function()
+				return snapshotStore:GetAsync(chunkKey(i))
+			end)
+			if not okChunk or typeof(chunk) ~= "table" or chunk.v ~= meta.v then
+				torn = true -- mid-write; version mismatch between meta and chunk
+				break
+			end
+			for _, record in ipairs(chunk.records) do
+				table.insert(records, record)
+			end
+		end
+
+		if not torn then
+			return { v = meta.v, records = records }
+		end
+		task.wait(0.5) -- let the in-progress write finish, then retry
 	end
+
+	log("snapshot appears torn after retries; falling back to commit log")
 	return nil
 end
 

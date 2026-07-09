@@ -36,6 +36,7 @@ export type Config = {
 	maxOpsPerCommit: number, -- cap ops in one commit (rate-limit safety)
 	maxCommitBytes: number, -- soft cap on a serialized commit
 	inlineMessageBytes: number, -- if a commit serializes under this, inline it in the message
+	snapshotChunkSize: number, -- records per snapshot chunk (keeps each DataStore value under the 4MB limit)
 
 	-- Class names never synced (local-only / client-only instances).
 	classBlacklist: { [string]: boolean },
@@ -71,6 +72,7 @@ local defaults: Config = {
 	maxOpsPerCommit = 200,
 	maxCommitBytes = 28000, -- under the 32KB MemoryStore value ceiling
 	inlineMessageBytes = 700, -- under the 1KB MessagingService ceiling
+	snapshotChunkSize = 500, -- ~hundreds of records per chunk keeps values well under 4MB
 
 	classBlacklist = {
 		Camera = true,

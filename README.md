@@ -147,6 +147,7 @@ ServerExpansion.Schema.addCustom({ "Transparency", "CanCollide" })
 | `commitInterval` | `0.5` | Seconds between flushing local changes |
 | `reconcileInterval` | `10` | Seconds between fallback pulls (missed messages) |
 | `snapshotInterval` | `60` | Seconds between world snapshots (elected writer) |
+| `snapshotChunkSize` | `500` | Records per snapshot chunk (keeps each DataStore value under 4MB) |
 | `commitTtl` | `3600` | Commit lifetime in the log (seconds) |
 | `maxOpsPerCommit` | `200` | Cap ops per commit (rate-limit safety) |
 | `syncPlayerCharacters` | `true` | Also sync player Characters as remote avatars |
@@ -173,8 +174,28 @@ rate-limited services. Design accordingly:
   exactly "the latest version wins". There is no 3-way merge.
 - **Only changes are sent.** Unchanged instances cost nothing. This is the core
   of the model, not an optimization you configure.
-- **Snapshots are bounded** by the DataStore value size (~4 MB serialized). Very
-  large worlds may need chunked snapshots (not implemented in v1).
+- **Snapshots are chunked** across fixed DataStore keys (`<key>_meta` + `<key>_i`)
+  to stay under the 4 MB per-value limit, while still keeping only the latest
+  snapshot (keys are overwritten, not versioned). Tune `snapshotChunkSize`.
+
+### New-server bootstrap (how a fresh server catches up without hitting limits)
+
+A newly-started server does **not** query the running servers — that would fan
+out across N servers and blow the MessagingService budget. Instead it rebuilds
+from shared storage with a bounded, server-count-independent cost:
+
+1. One read of the chunked **snapshot** (DataStore) → the whole world at version `vS`.
+2. A short **commit-log** replay (MemoryStore) for `vS+1 .. HEAD`.
+3. Subscribe and go live.
+
+Because the elected writer refreshes the snapshot every `snapshotInterval` and
+that is kept below `commitTtl`, the snapshot always overlaps the surviving
+commits, so the replay is only ever the last ~`snapshotInterval` of changes.
+
+The snapshot lives in its **own** DataStore (`snapshotStoreName`), so it never
+touches your game's other data. Only the single elected server writes it (at
+`snapshotInterval`); other servers read it just once at startup. If your game is
+DataStore-heavy, raise `snapshotInterval` to give your own saves more budget.
 - **Server only.** `start()` errors if called on a client.
 
 ---
