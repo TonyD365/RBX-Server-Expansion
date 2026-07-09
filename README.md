@@ -50,6 +50,7 @@ Three Roblox services do the heavy lifting:
 src/ServerExpansion/
   init.luau          Facade: ServerExpansion.start(config?)
   Config.luau        Overridable settings (root, intervals, TTLs, topic, ...)
+  ClientInterpolator.luau  CLIENT-side smoothing of stepped remote CFrames
   Codec.luau         Roblox datatypes <-> JSON-safe form (Instance refs by id)
   Schema.luau        Which classes/properties are trackable (extensible)
   Identity.luau      Stable cross-server ids + id<->instance registry
@@ -127,6 +128,34 @@ ServerExpansion.Schema.extend("BoolValue", { "Value" })
 ServerExpansion.Schema.addCustom({ "Transparency", "CanCollide" })
 ```
 
+### Reliability & rate-limit behaviour
+
+- **No dropped changes.** If a push fails (throttling / transient fault), the
+  ops are re-queued and retried on the next tick instead of being lost.
+- **Adaptive backoff.** Repeated push failures exponentially lengthen the commit
+  interval (up to `maxCommitInterval`), then snap back to `commitInterval` once
+  a push succeeds — so a throttled MemoryStore isn't hammered.
+- **Graceful shutdown.** On server close, last-moment local changes are flushed
+  and (if this server is the elected writer) a final snapshot is written, so a
+  full shutdown loses nothing.
+
+### Client smoothing (optional, visual)
+
+Replication updates a mirrored instance's CFrame only every ~commit interval, so
+remote objects/avatars step. Run `ClientInterpolator` from a LocalScript to ease
+anchored synced parts toward their latest replicated CFrame:
+
+```lua
+-- LocalScript in StarterPlayerScripts (copy ClientInterpolator to a client-
+-- reachable location such as ReplicatedStorage):
+local ClientInterpolator = require(game.ReplicatedStorage.ClientInterpolator)
+ClientInterpolator.start({ speed = 12 }) -- higher = snappier, lower = smoother
+```
+
+It only rewrites anchored parts' CFrame locally (purely visual, never
+replicated back) and detects new targets by polling rather than Changed-signal
+timing, so it's robust under Deferred signal behaviour.
+
 ### What gets synced
 
 - **Properties**: whatever the per-class schema lists *and* the instance actually
@@ -145,6 +174,7 @@ ServerExpansion.Schema.addCustom({ "Transparency", "CanCollide" })
 | `getSyncRoot` | `() -> workspace` | Root instance whose descendants are synced |
 | `idAttribute` | `"SXID"` | Attribute name for the cross-server id |
 | `commitInterval` | `0.5` | Seconds between flushing local changes |
+| `maxCommitInterval` | `30` | Cap the commit interval backs off to under repeated push failures |
 | `reconcileInterval` | `10` | Seconds between fallback pulls (missed messages) |
 | `snapshotInterval` | `60` | Seconds between world snapshots (elected writer) |
 | `snapshotChunkSize` | `500` | Records per snapshot chunk (keeps each DataStore value under 4MB) |
@@ -298,6 +328,24 @@ ServerExpansion.Schema.addCustom({ "Transparency", "CanCollide" })
 - **Attributes**：全部，始终同步——新增、修改、删除都同步。
 - **结构**：实例的新建、改父级、删除。
 - **只发有改动的**：没变的实例/属性/attribute 不发任何东西。
+
+## 可靠性与限流
+
+- **不丢改动**：push 失败（被限流/瞬时错误）时，op 会重新入队，下一拍重试，而不是丢弃。
+- **自适应退避**：连续 push 失败会指数级拉长 commit 间隔（上限 `maxCommitInterval`），一旦成功就恢复到 `commitInterval`——避免猛捶被限流的 MemoryStore。
+- **优雅关服**：关服时先 flush 掉最后的本地改动，再（若本服是被选举的写入者）写一份最终快照，整服关闭也不丢数据。
+
+## 客户端平滑（可选，纯视觉）
+
+跨服镜像的物体每 ~一个 commit 间隔才更新一次 CFrame，会一跳一跳。用 LocalScript 跑 `ClientInterpolator`，把带 `SXID` 的**锚定**同步件平滑地插值到最新 CFrame：
+
+```lua
+-- StarterPlayerScripts 里的 LocalScript（把 ClientInterpolator 复制到客户端可达的位置，如 ReplicatedStorage）：
+local ClientInterpolator = require(game.ReplicatedStorage.ClientInterpolator)
+ClientInterpolator.start({ speed = 12 }) -- 越大越跟手，越小越平滑
+```
+
+它只在本地改写锚定件的 CFrame（纯视觉、不回传），并用轮询而非 Changed 信号来识别新目标，因此在 Deferred 信号模式下也稳。
 
 ## 限制与注意事项（务必阅读）
 

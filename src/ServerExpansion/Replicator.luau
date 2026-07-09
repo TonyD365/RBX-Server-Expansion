@@ -31,6 +31,11 @@ local started = false
 local localHead = 0
 local pulling = false
 
+-- Reliability/perf state.
+local pendingOps: { any } = {} -- ops that failed to push; retried next interval
+local consecutiveFailures = 0
+local currentInterval = 0.5 -- adaptive commit interval (backs off under failure)
+
 local function log(...)
 	if config and config.debug then
 		print("[ServerExpansion.Replicator]", ...)
@@ -64,8 +69,10 @@ local function pullNow()
 	end
 end
 
--- Split ops into commits no larger than maxOpsPerCommit and push each.
-local function pushOps(ops: { any })
+-- Split ops into commits no larger than maxOpsPerCommit and push each. Returns
+-- the ops that could NOT be pushed (from the first failing chunk onward) so the
+-- caller can re-queue them -- changes are never silently dropped.
+local function pushOps(ops: { any }): { any }
 	local i = 1
 	while i <= #ops do
 		local chunk = {}
@@ -73,22 +80,55 @@ local function pushOps(ops: { any })
 		for j = i, last do
 			table.insert(chunk, ops[j])
 		end
-		i = last + 1
 
 		local commit = { author = jobId, t = os.time(), ops = chunk }
 		local version = Repository.pushCommit(commit)
-		if version then
-			localHead = math.max(localHead, version)
-			-- Notify peers; payload is just the version number (tiny, well
-			-- under the 1KB MessagingService limit). Peers pull the commit.
-			pcall(function()
-				MessagingService:PublishAsync(topic, { v = version, from = jobId })
-			end)
-			log("pushed commit", version, "with", #chunk, "ops")
-		else
-			log("push failed; ops will be retried next interval")
-			-- Re-mark? For simplicity we drop; reconcile/snapshot heals drift.
+		if not version then
+			-- Return everything not yet pushed (this chunk included).
+			log("push failed; re-queuing", #ops - i + 1, "ops")
+			return table.move(ops, i, #ops, 1, {})
 		end
+
+		localHead = math.max(localHead, version)
+		-- Notify peers; payload is just the version number (tiny, well under the
+		-- 1KB MessagingService limit). Peers pull the commit.
+		pcall(function()
+			MessagingService:PublishAsync(topic, { v = version, from = jobId })
+		end)
+		log("pushed commit", version, "with", #chunk, "ops")
+		i = last + 1
+	end
+	return {}
+end
+
+-- One commit-loop tick: drain local changes (plus anything re-queued), push,
+-- and adapt the interval. Returns nothing; updates module state.
+local function flushTick()
+	local ops = ChangeTracker.collect()
+
+	-- Prepend previously-failed ops so ordering is preserved (older first).
+	if #pendingOps > 0 then
+		local combined = table.clone(pendingOps)
+		for _, op in ipairs(ops) do
+			table.insert(combined, op)
+		end
+		ops = combined
+		table.clear(pendingOps)
+	end
+
+	if #ops == 0 then
+		return
+	end
+
+	local leftover = pushOps(ops)
+	if #leftover > 0 then
+		pendingOps = leftover
+		consecutiveFailures += 1
+		-- Exponential backoff, capped, to avoid hammering a throttled store.
+		currentInterval = math.min(config.maxCommitInterval, config.commitInterval * 2 ^ consecutiveFailures)
+	else
+		consecutiveFailures = 0
+		currentInterval = config.commitInterval
 	end
 end
 
@@ -118,14 +158,11 @@ local function bootstrap()
 end
 
 local function startLoops()
-	-- Commit loop: flush local changes on the commit interval.
+	-- Commit loop: flush local changes on the (adaptive) commit interval.
 	task.spawn(function()
 		while started do
-			task.wait(config.commitInterval)
-			local ops = ChangeTracker.collect()
-			if #ops > 0 then
-				pushOps(ops)
-			end
+			task.wait(currentInterval)
+			flushTick()
 		end
 	end)
 
@@ -157,6 +194,7 @@ function Replicator.start(resolvedConfig: any)
 	end
 	config = resolvedConfig
 	topic = config.topic
+	currentInterval = config.commitInterval
 
 	jobId = game.JobId
 	if jobId == "" then
@@ -192,8 +230,16 @@ function Replicator.start(resolvedConfig: any)
 	started = true
 	startLoops()
 
-	-- Best-effort snapshot on shutdown so the next server starts fresher.
+	-- On shutdown: flush any last-moment local changes so they are not lost,
+	-- then (if elected) write a final snapshot. BindToClose runs synchronously
+	-- and may yield, so these blocking calls are safe here.
 	game:BindToClose(function()
+		flushTick() -- push remaining + previously-queued ops
+		if #pendingOps > 0 then
+			-- One more attempt for anything still queued after a transient fail.
+			pushOps(pendingOps)
+			table.clear(pendingOps)
+		end
 		if Repository.acquireSnapshotLock(jobId) then
 			local records = ChangeTracker.serializeWorld()
 			Repository.saveSnapshot(records, localHead)

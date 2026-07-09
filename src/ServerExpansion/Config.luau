@@ -24,6 +24,7 @@ export type Config = {
 
 	-- Timing (seconds).
 	commitInterval: number, -- how often local changes are flushed into a commit
+	maxCommitInterval: number, -- upper bound the commit interval backs off to under failures
 	reconcileInterval: number, -- how often to pull missed commits as a fallback
 	snapshotInterval: number, -- how often the elected server writes a snapshot
 
@@ -62,6 +63,7 @@ local defaults: Config = {
 	topic = "SX_Commit_v1",
 
 	commitInterval = 0.5,
+	maxCommitInterval = 30, -- back off up to this under repeated push failures
 	reconcileInterval = 10,
 	snapshotInterval = 60,
 
